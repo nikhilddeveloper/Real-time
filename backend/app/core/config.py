@@ -19,6 +19,8 @@ class Settings:
     app_version: str
     openai_api_key: str
     openai_model: str
+    ai_base_url: str | None
+    ai_provider: str
     whisper_model: str
     transcription_language: str
     transcription_prompt: str
@@ -35,12 +37,21 @@ def get_settings() -> Settings:
     )
     origins = {origin.strip() for origin in configured_origins.split(",") if origin.strip()}
     origins.update({"http://localhost:3000", "http://127.0.0.1:3000"})
+    openrouter_api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    openai_api_key = os.getenv("OPENAI_API_KEY") or os.getenv("api_key", "")
+    using_openrouter = bool(openrouter_api_key)
 
     return Settings(
-        app_name="Practice Room API",
-        app_version="1.0.0",
-        openai_api_key=os.getenv("OPENAI_API_KEY") or os.getenv("api_key", ""),
-        openai_model=os.getenv("OPENAI_MODEL", "gpt-5.6-sol"),
+        app_name="Meeting Lens API",
+        app_version="1.1.0",
+        openai_api_key=openrouter_api_key or openai_api_key,
+        openai_model=(
+            os.getenv("OPENROUTER_MODEL", "openai/gpt-4o")
+            if using_openrouter
+            else os.getenv("OPENAI_MODEL", "gpt-5.6-sol")
+        ),
+        ai_base_url="https://openrouter.ai/api/v1" if using_openrouter else None,
+        ai_provider="openrouter" if using_openrouter else "openai",
         whisper_model=os.getenv("WHISPER_MODEL", "base"),
         transcription_language=os.getenv("TRANSCRIPTION_LANGUAGE", "en"),
         transcription_prompt=os.getenv(

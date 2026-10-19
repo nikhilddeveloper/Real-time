@@ -36,7 +36,7 @@ async def coach_text(request: TextCoachRequest) -> CoachResponse:
     except ConfigurationError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except RateLimitError as exc:
-        raise HTTPException(status_code=503, detail="The OpenAI account has no available API quota.") from exc
+        raise HTTPException(status_code=503, detail="The configured AI provider has no available API quota.") from exc
     except OpenAIError as exc:
         logger.exception("OpenAI text coaching request failed")
         raise HTTPException(status_code=502, detail="The answer service is temporarily unavailable.") from exc
@@ -86,14 +86,14 @@ async def coach(
     except RateLimitError as exc:
         raise HTTPException(
             status_code=503,
-            detail="The OpenAI account has no available API quota. Check billing and try again.",
+            detail="The configured AI provider has no available API quota. Check billing and try again.",
         ) from exc
     except AuthenticationError as exc:
         raise HTTPException(
             status_code=503,
             detail=(
-                "OPENAI_API_KEY is missing or invalid. Set a valid key in backend/.env "
-                "or the project .env file, then restart the backend."
+                "The configured AI provider key is missing or invalid. Update the project "
+                "environment, then restart the backend."
             ),
         ) from exc
     except OpenAIError as exc:
@@ -132,7 +132,7 @@ async def notes(request: NotesRequest) -> NotesResponse:
     except ConfigurationError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except RateLimitError as exc:
-        raise HTTPException(status_code=503, detail="The OpenAI account has no available API quota.") from exc
+        raise HTTPException(status_code=503, detail="The configured AI provider has no available API quota.") from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except OpenAIError as exc:

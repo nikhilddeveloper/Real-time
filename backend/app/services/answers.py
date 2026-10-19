@@ -12,12 +12,20 @@ MAX_WORDS = 60
 
 @lru_cache(maxsize=1)
 def get_openai_client() -> AsyncOpenAI:
-    api_key = get_settings().openai_api_key
+    settings = get_settings()
+    api_key = settings.openai_api_key
     if not api_key:
         raise ConfigurationError(
-            "Set OPENAI_API_KEY in backend/.env or the project .env file."
+            "Set OPENROUTER_API_KEY or OPENAI_API_KEY in the project environment."
         )
-    return AsyncOpenAI(api_key=api_key)
+    client_options: dict[str, object] = {"api_key": api_key}
+    if settings.ai_base_url:
+        client_options["base_url"] = settings.ai_base_url
+        client_options["default_headers"] = {
+            "HTTP-Referer": "http://localhost:3000",
+            "X-OpenRouter-Title": "Meeting Lens",
+        }
+    return AsyncOpenAI(**client_options)
 
 
 async def generate_practice_answer(
@@ -36,8 +44,6 @@ async def generate_practice_answer(
     for _ in range(2):
         response = await client.responses.create(
             model=settings.openai_model,
-            reasoning={"effort": "none"},
-            text={"verbosity": "low"},
             instructions=(
                 "You are a mock-interview coach. Draft a confident, truthful practice "
                 "answer to the interviewer's question. The answer must contain between "
@@ -82,9 +88,7 @@ async def generate_session_notes(
     )
     response = await client.responses.create(
         model=settings.openai_model,
-        reasoning={"effort": "none"},
         text={
-            "verbosity": "low",
             "format": {
                 "type": "json_schema",
                 "name": "practice_session_notes",

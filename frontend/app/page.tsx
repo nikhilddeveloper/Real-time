@@ -2,242 +2,225 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-type CoachResult = { question: string; answer: string; word_count: number };
-type SessionNotes = { summary: string; strengths: string[]; improvements: string[]; next_steps: string[] };
-type SessionState = "idle" | "listening" | "hearing" | "processing" | "answering" | "error";
-type WorkspaceTab = "coach" | "questions" | "transcript" | "notes" | "context";
+type AudioSource = "microphone" | "meeting-tab";
+type MeetingState = "setup" | "connecting" | "live" | "ended";
+type TranscriptSegment = { text: string; isQuestion: boolean };
+type InsightsUpdate = {
+  summary: string;
+  action_items: string[];
+  follow_up_questions: string[];
+};
 
-const SILENCE_TO_SUBMIT_MS = 1400;
-const MAX_QUESTION_MS = 30000;
-const EMPTY_CYCLE_MS = 20000;
-const QUESTION_BANK = [
-  { category: "Python", question: "How do you structure a production Python project?" },
-  { category: "Python", question: "Explain decorators and give a practical use case." },
-  { category: "Backend", question: "How would you design a scalable REST API?" },
-  { category: "System design", question: "How would you design a URL shortening service?" },
-  { category: "Behavioral", question: "Tell me about a difficult technical problem you solved." },
-  { category: "Behavioral", question: "Describe a disagreement with a teammate and how you handled it." },
-];
+const SEGMENT_MS = 4000;
 
 export default function Home() {
-  const [tab, setTab] = useState<WorkspaceTab>("coach");
-  const [sessionState, setSessionState] = useState<SessionState>("idle");
-  const [result, setResult] = useState<CoachResult | null>(null);
-  const [turns, setTurns] = useState<CoachResult[]>([]);
-  const [notes, setNotes] = useState<SessionNotes | null>(null);
-  const [notesLoading, setNotesLoading] = useState(false);
+  const [meetingState, setMeetingState] = useState<MeetingState>("setup");
+  const [source, setSource] = useState<AudioSource>("microphone");
+  const [consent, setConsent] = useState(false);
+  const [title, setTitle] = useState("Team sync");
+  const [context, setContext] = useState("");
+  const [elapsed, setElapsed] = useState(0);
+  const [transcript, setTranscript] = useState<TranscriptSegment[]>([]);
+  const [summary, setSummary] = useState("");
+  const [actionItems, setActionItems] = useState<string[]>([]);
+  const [followUps, setFollowUps] = useState<string[]>([]);
+  const [processing, setProcessing] = useState(false);
+  const [analyzing, setAnalyzing] = useState(false);
   const [error, setError] = useState("");
-  const [role, setRole] = useState("Python Backend Developer");
-  const [company, setCompany] = useState("");
-  const [instructions, setInstructions] = useState("");
-  const [answerStyle, setAnswerStyle] = useState("concise");
-  const sessionActiveRef = useRef(false);
-  const streamRef = useRef<MediaStream | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const analyserRef = useRef<AnalyserNode | null>(null);
-  const recorderRef = useRef<MediaRecorder | null>(null);
-  const animationRef = useRef<number | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
-  const beginCaptureCycleRef = useRef<(stream: MediaStream) => void>(() => undefined);
-  const heardSpeechRef = useRef(false);
-  const lastSpeechAtRef = useRef(0);
-  const cycleStartedAtRef = useRef(0);
-  const noiseFloorRef = useRef(0.004);
-  const speechFramesRef = useRef(0);
 
-  const stopAudioResources = useCallback(() => {
-    sessionActiveRef.current = false;
-    if (animationRef.current !== null) cancelAnimationFrame(animationRef.current);
-    animationRef.current = null;
+  const activeRef = useRef(false);
+  const captureStreamRef = useRef<MediaStream | null>(null);
+  const recordingStreamRef = useRef<MediaStream | null>(null);
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const segmentTimerRef = useRef<number | null>(null);
+  const clockRef = useRef<number | null>(null);
+  const uploadQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const analysisQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const summaryRef = useRef("");
+  const transcriptRef = useRef<TranscriptSegment[]>([]);
+
+  useEffect(() => { summaryRef.current = summary; }, [summary]);
+
+  const stopCapture = useCallback(() => {
+    activeRef.current = false;
+    if (segmentTimerRef.current !== null) window.clearTimeout(segmentTimerRef.current);
+    if (clockRef.current !== null) window.clearInterval(clockRef.current);
+    segmentTimerRef.current = null;
+    clockRef.current = null;
     if (recorderRef.current?.state === "recording") recorderRef.current.stop();
     recorderRef.current = null;
-    streamRef.current?.getTracks().forEach((track) => track.stop());
-    streamRef.current = null;
-    void audioContextRef.current?.close();
-    audioContextRef.current = null;
-    analyserRef.current = null;
+    recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
+    captureStreamRef.current?.getTracks().forEach((track) => track.stop());
+    recordingStreamRef.current = null;
+    captureStreamRef.current = null;
+    setProcessing(false);
   }, []);
 
-  useEffect(() => stopAudioResources, [stopAudioResources]);
+  useEffect(() => stopCapture, [stopCapture]);
 
-  const acceptResult = useCallback((payload: CoachResult) => {
-    setResult(payload);
-    setTurns((current) => [...current, payload]);
-    setNotes(null);
-    setSessionState("answering");
-    setTab("coach");
-  }, []);
-
-  const sendQuestion = useCallback(async (blob: Blob) => {
-    stopAudioResources();
-    setSessionState("processing");
-    setError("");
-    const mimeType = blob.type || "audio/webm";
-    const extension = mimeType.includes("ogg") ? "ogg" : "webm";
-    const formData = new FormData();
-    formData.append("file", new File([blob], `practice-question.${extension}`, { type: mimeType }));
-    formData.append("role", role);
-    formData.append("company", company);
-    formData.append("instructions", instructions);
-    formData.append("answer_style", answerStyle);
+  const requestInsights = useCallback(async (segments: TranscriptSegment[]) => {
+    if (!segments.length) return;
+    setAnalyzing(true);
     try {
-      const response = await fetch("/api/coach", { method: "POST", body: formData });
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(payload.detail || "The coach could not process this question.");
-      acceptResult(payload as CoachResult);
-    } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "Could not connect to the coaching service.");
-      setSessionState("error");
-    }
-  }, [acceptResult, answerStyle, company, instructions, role, stopAudioResources]);
-
-  const practiceQuestion = useCallback(async (question: string) => {
-    stopAudioResources();
-    setSessionState("processing");
-    setError("");
-    setTab("coach");
-    try {
-      const response = await fetch("/api/coach/text", {
+      const response = await fetch("/api/meeting/insights", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ question, role, company, instructions, answer_style: answerStyle }),
+        body: JSON.stringify({
+          transcript: segments.slice(-30).map((segment) => segment.text).join("\n"),
+          previous_summary: summaryRef.current,
+          meeting_context: `${title}\n${context}`,
+        }),
       });
       const payload = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(payload.detail || "The coach could not process this question.");
-      acceptResult(payload as CoachResult);
+      if (!response.ok) throw new Error(payload.detail || "Could not update meeting insights.");
+      const update = payload as InsightsUpdate;
+      setSummary(update.summary);
+      setActionItems(update.action_items);
+      setFollowUps(update.follow_up_questions);
     } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "Could not connect to the coaching service.");
-      setSessionState("error");
+      setError(requestError instanceof Error ? requestError.message : "Meeting insights failed.");
+    } finally {
+      setAnalyzing(false);
     }
-  }, [acceptResult, answerStyle, company, instructions, role, stopAudioResources]);
+  }, [context, title]);
 
-  const beginCaptureCycle = useCallback((stream: MediaStream) => {
-    if (!sessionActiveRef.current || !analyserRef.current) return;
-    const recorder = new MediaRecorder(stream);
-    const analyser = analyserRef.current;
-    const samples = new Uint8Array(analyser.fftSize);
-    chunksRef.current = [];
-    heardSpeechRef.current = false;
-    lastSpeechAtRef.current = 0;
-    cycleStartedAtRef.current = performance.now();
-    noiseFloorRef.current = 0.004;
-    speechFramesRef.current = 0;
-    recorderRef.current = recorder;
-    recorder.ondataavailable = (event) => { if (event.data.size > 0) chunksRef.current.push(event.data); };
-    recorder.onstop = () => {
-      if (animationRef.current !== null) cancelAnimationFrame(animationRef.current);
-      animationRef.current = null;
-      const blob = new Blob(chunksRef.current, { type: recorder.mimeType || "audio/webm" });
-      if (heardSpeechRef.current && blob.size > 0) void sendQuestion(blob);
-      else if (sessionActiveRef.current && stream.active) beginCaptureCycleRef.current(stream);
-    };
-    recorder.start(250);
-    setSessionState("listening");
-    const monitor = () => {
-      if (!sessionActiveRef.current || recorder.state !== "recording") return;
-      analyser.getByteTimeDomainData(samples);
-      let energy = 0;
-      for (const sample of samples) { const normalized = (sample - 128) / 128; energy += normalized * normalized; }
-      const rms = Math.sqrt(energy / samples.length);
-      const now = performance.now();
-      const elapsed = now - cycleStartedAtRef.current;
-      if (!heardSpeechRef.current && elapsed < 1200) noiseFloorRef.current = noiseFloorRef.current * 0.9 + rms * 0.1;
-      const speechThreshold = Math.max(0.006, noiseFloorRef.current * 2.2);
-      if (rms > speechThreshold) {
-        speechFramesRef.current += 1;
-        if (speechFramesRef.current >= 5) heardSpeechRef.current = true;
-        lastSpeechAtRef.current = now;
-        setSessionState("hearing");
-      } else if (heardSpeechRef.current) {
-        speechFramesRef.current = 0;
-        setSessionState("listening");
-        if (now - lastSpeechAtRef.current >= SILENCE_TO_SUBMIT_MS) { recorder.stop(); return; }
-      }
-      if (elapsed >= MAX_QUESTION_MS || (!heardSpeechRef.current && elapsed >= EMPTY_CYCLE_MS)) { recorder.stop(); return; }
-      animationRef.current = requestAnimationFrame(monitor);
-    };
-    animationRef.current = requestAnimationFrame(monitor);
-  }, [sendQuestion]);
-
-  useEffect(() => { beginCaptureCycleRef.current = beginCaptureCycle; }, [beginCaptureCycle]);
-
-  async function startListening() {
-    setError("");
-    if (!navigator.mediaDevices?.getUserMedia) { setError("Microphone listening is not supported in this browser."); return; }
+  const uploadSegment = useCallback(async (blob: Blob) => {
+    if (blob.size < 1000) return;
+    setProcessing(true);
+    const mimeType = blob.type || "audio/webm";
+    const formData = new FormData();
+    formData.append("file", new File([blob], "meeting-segment.webm", { type: mimeType }));
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 } });
-      const audioContext = new AudioContext();
-      const analyser = audioContext.createAnalyser();
-      analyser.fftSize = 2048;
-      analyser.smoothingTimeConstant = 0.25;
-      audioContext.createMediaStreamSource(stream).connect(analyser);
-      streamRef.current = stream;
-      audioContextRef.current = audioContext;
-      analyserRef.current = analyser;
-      sessionActiveRef.current = true;
-      beginCaptureCycle(stream);
-    } catch { setError("Microphone access was blocked. Allow microphone access and try again."); setSessionState("error"); }
-  }
-
-  async function generateNotes() {
-    setNotesLoading(true);
-    setError("");
-    try {
-      const response = await fetch("/api/notes", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ role, company, turns }) });
+      const response = await fetch("/api/meeting/transcribe", { method: "POST", body: formData });
       const payload = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(payload.detail || "Could not generate notes.");
-      setNotes(payload as SessionNotes);
-    } catch (requestError) { setError(requestError instanceof Error ? requestError.message : "Could not generate notes."); }
-    finally { setNotesLoading(false); }
+      if (response.status === 422 && String(payload.detail || "").includes("No speech")) return;
+      if (!response.ok) throw new Error(payload.detail || "Could not process this audio segment.");
+      const text = String(payload.transcript || "").trim();
+      if (text) {
+        const next = [...transcriptRef.current, { text, isQuestion: Boolean(payload.is_question) }];
+        transcriptRef.current = next;
+        setTranscript(next);
+        if (next.length % 3 === 0) {
+          analysisQueueRef.current = analysisQueueRef.current.then(() => requestInsights(next));
+        }
+      }
+      setError("");
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Meeting analysis failed.");
+    } finally {
+      setProcessing(false);
+    }
+  }, [requestInsights]);
+
+  const beginSegment = useCallback((stream: MediaStream) => {
+    if (!activeRef.current || !stream.active) return;
+    const chunks: Blob[] = [];
+    const recorder = new MediaRecorder(stream);
+    recorderRef.current = recorder;
+    recorder.ondataavailable = (event) => { if (event.data.size > 0) chunks.push(event.data); };
+    recorder.onstop = () => {
+      if (!activeRef.current) return;
+      const blob = new Blob(chunks, { type: recorder.mimeType || "audio/webm" });
+      beginSegment(stream);
+      uploadQueueRef.current = uploadQueueRef.current.then(() => uploadSegment(blob));
+    };
+    recorder.start(1000);
+    segmentTimerRef.current = window.setTimeout(() => {
+      if (recorder.state === "recording") recorder.stop();
+    }, SEGMENT_MS);
+  }, [uploadSegment]);
+
+  async function startMeeting() {
+    if (!consent) return;
+    setMeetingState("connecting");
+    setError("");
+    try {
+      let captureStream: MediaStream;
+      if (source === "meeting-tab") {
+        captureStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+        if (captureStream.getAudioTracks().length === 0) {
+          captureStream.getTracks().forEach((track) => track.stop());
+          throw new Error("No shared audio was selected. Choose a browser tab and enable Share tab audio.");
+        }
+      } else {
+        captureStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }, video: false });
+      }
+      const audioStream = new MediaStream(captureStream.getAudioTracks());
+      captureStream.getTracks().forEach((track) => {
+        track.addEventListener("ended", () => { if (activeRef.current) endMeeting(); }, { once: true });
+      });
+      captureStreamRef.current = captureStream;
+      recordingStreamRef.current = audioStream;
+      activeRef.current = true;
+      setElapsed(0);
+      setMeetingState("live");
+      clockRef.current = window.setInterval(() => setElapsed((value) => value + 1), 1000);
+      beginSegment(audioStream);
+    } catch (captureError) {
+      setError(captureError instanceof Error ? captureError.message : "Audio permission was not granted.");
+      setMeetingState("setup");
+    }
   }
 
-  function newSession() {
-    stopAudioResources();
-    setTurns([]); setResult(null); setNotes(null); setError(""); setSessionState("idle"); setTab("coach");
+  function endMeeting() {
+    stopCapture();
+    setMeetingState("ended");
+    if (transcriptRef.current.length) {
+      analysisQueueRef.current = analysisQueueRef.current.then(() => requestInsights(transcriptRef.current));
+    }
   }
 
-  const isActive = ["listening", "hearing", "processing"].includes(sessionState);
-  const statusCopy = { idle: "Ready for a practice question", listening: "Listening for the question", hearing: "Question detected…", processing: "Preparing your practice answer…", answering: "Your turn to practice", error: "Practice paused" }[sessionState];
-  const tabs: { id: WorkspaceTab; label: string; count?: number }[] = [
-    { id: "coach", label: "Practice room" }, { id: "questions", label: "Question bank", count: QUESTION_BANK.length }, { id: "transcript", label: "Transcript", count: turns.length }, { id: "notes", label: "AI notes" }, { id: "context", label: "Role & context" },
-  ];
+  function resetMeeting() {
+    stopCapture();
+    transcriptRef.current = [];
+    setTranscript([]); setSummary(""); setActionItems([]); setFollowUps([]); setElapsed(0); setError(""); setMeetingState("setup");
+  }
+
+  function downloadTranscript() {
+    const text = [`${title} — Meeting transcript`, "", ...transcript.map((segment) => `${segment.isQuestion ? "[Question] " : ""}${segment.text}`), "", "Summary", summary, "", "Action items", ...actionItems.map((item) => `- ${item}`)].join("\n");
+    const url = URL.createObjectURL(new Blob([text], { type: "text/plain" }));
+    const link = document.createElement("a");
+    link.href = url; link.download = `${title.toLowerCase().replace(/[^a-z0-9]+/g, "-") || "meeting"}-notes.txt`; link.click();
+    URL.revokeObjectURL(url);
+  }
+
+  const time = `${String(Math.floor(elapsed / 60)).padStart(2, "0")}:${String(elapsed % 60).padStart(2, "0")}`;
 
   return (
-    <main className="app-shell">
-      <aside className="sidebar">
-        <div className="workspace-brand"><span>P</span><div><strong>Practice Room</strong><small>AI interview preparation</small></div></div>
-        <button className="new-session" type="button" onClick={newSession}>＋ New practice session</button>
-        <nav aria-label="Workspace">{tabs.map((item) => <button key={item.id} className={tab === item.id ? "active" : ""} type="button" onClick={() => setTab(item.id)}><span>{item.label}</span>{item.count !== undefined && <em>{item.count}</em>}</button>)}</nav>
-        <div className="responsible-card"><strong>Practice mode</strong><p>Built for mock interviews and disclosed coaching. Microphone access is visible and controlled by you.</p></div>
-      </aside>
+    <main className="meeting-app">
+      <header className="app-header">
+        <div className="brand"><span>M</span><div><strong>Meeting Lens</strong><small>Real-time AI meeting assistant</small></div></div>
+        <div className={`privacy-badge ${meetingState === "live" ? "live" : ""}`}><i />{meetingState === "live" ? "AI assistance active · visible" : "Consent-based assistance"}</div>
+      </header>
 
-      <section className="workspace-main">
-        <header className="workspace-topbar"><div><span className="live-dot" /> Mock session</div><div className="session-meta"><strong>{role || "General interview"}</strong>{company && <span> · {company}</span>}</div></header>
-
-        {tab === "coach" && <div className="panel-page">
-          <div className="page-heading"><div><span className="overline">LIVE PRACTICE COACH</span><h1>Turn questions into stronger answers.</h1><p>Speak one mock question. The microphone switches off before your practice response appears.</p></div><div className="session-count"><strong>{turns.length}</strong><span>questions practiced</span></div></div>
-          <section className={`coach-console ${isActive ? "active" : ""}`}>
-            <div className="console-copy"><span className="status-tag">{sessionState === "answering" ? "MICROPHONE OFF" : "VOICE INPUT"}</span><h2>{statusCopy}</h2><p>{sessionState === "answering" ? "Say the suggested answer in your own words. When finished, choose the next question." : sessionState === "processing" ? "Transcribing the question and building a role-aware response." : "Ask a practice question near this device. A short silence submits it automatically."}</p></div>
-            <div className={`audio-orb ${sessionState}`}><span className="mic-icon" /><i /><i /></div>
-            <div className="wave-row">{Array.from({ length: 25 }, (_, index) => <span key={index} />)}</div>
-            <div className="console-actions">{!isActive ? <button className="primary-action" type="button" onClick={() => void startListening()}>{turns.length ? "Listen for next question" : "Start voice practice"}</button> : <button className="secondary-action" type="button" onClick={() => { stopAudioResources(); setSessionState("idle"); }}>Stop listening</button>}<small>{sessionState === "answering" ? "Your answer is not being recorded." : "Browser microphone only · no meeting or system audio"}</small></div>
-            {error && <div className="inline-error" role="alert"><strong>Couldn’t complete that.</strong> {error}</div>}
-          </section>
-          {result ? <section className="answer-grid" aria-live="polite"><article className="question-panel"><span>QUESTION {turns.length}</span><p>{result.question}</p></article><article className="answer-panel"><div><span>PRACTICE ANSWER</span><em>{result.word_count} words</em></div><blockquote>{result.answer}</blockquote><small>Personalize this with your real experience—never claim work you did not do.</small></article></section> : <section className="empty-answer"><span>Q → A</span><div><strong>Your role-aware answer will appear here</strong><p>Or choose a question from the Question bank to begin without audio.</p></div><button type="button" onClick={() => setTab("questions")}>Browse questions</button></section>}
-        </div>}
-
-        {tab === "questions" && <div className="panel-page"><PageHeading overline="QUESTION BANK" title="Practice what comes up most." copy="Choose a realistic prompt and get a concise answer shaped by your role and notes." /><div className="question-list">{QUESTION_BANK.map((item, index) => <article key={item.question}><div><span>{item.category}</span><em>0{index + 1}</em></div><h3>{item.question}</h3><button type="button" onClick={() => void practiceQuestion(item.question)}>Practice this question →</button></article>)}</div></div>}
-
-        {tab === "transcript" && <div className="panel-page"><PageHeading overline="SESSION TRANSCRIPT" title="Your practice history." copy="Questions and suggested answers from this browser session." />{turns.length ? <div className="transcript-list">{turns.map((turn, index) => <article key={`${turn.question}-${index}`}><header><span>{String(index + 1).padStart(2, "0")}</span><strong>{turn.question}</strong></header><p>{turn.answer}</p></article>)}</div> : <BlankState title="No questions yet" copy="Start in the Practice room or select a Question bank prompt." />}</div>}
-
-        {tab === "notes" && <div className="panel-page"><div className="page-heading compact"><div><span className="overline">AI COACHING NOTES</span><h1>Review, improve, repeat.</h1><p>Turn this session into a focused preparation plan.</p></div>{turns.length > 0 && <button className="primary-action small" type="button" disabled={notesLoading} onClick={() => void generateNotes()}>{notesLoading ? "Generating…" : notes ? "Refresh notes" : "Generate notes"}</button>}</div>{error && <div className="inline-error" role="alert">{error}</div>}{notes ? <div className="notes-layout"><article className="summary-note"><span>SUMMARY</span><p>{notes.summary}</p></article><NoteList title="Strengths to keep" items={notes.strengths} /><NoteList title="Areas to improve" items={notes.improvements} /><NoteList title="Next practice steps" items={notes.next_steps} /></div> : <BlankState title={turns.length ? "Notes are ready to generate" : "Complete a practice question first"} copy="We’ll summarize themes, strengths, improvements, and next steps." />}</div>}
-
-        {tab === "context" && <div className="panel-page narrow"><PageHeading overline="ROLE & CONTEXT" title="Make every answer relevant." copy="Add only truthful background. This information guides future practice answers." /><form className="context-form" onSubmit={(event) => { event.preventDefault(); setTab("coach"); }}><label>Target role<input value={role} onChange={(event) => setRole(event.target.value)} placeholder="e.g. Python Backend Developer" /></label><label>Company (optional)<input value={company} onChange={(event) => setCompany(event.target.value)} placeholder="e.g. Acme" /></label><label>Answer style<select value={answerStyle} onChange={(event) => setAnswerStyle(event.target.value)}><option value="concise">Concise and direct</option><option value="star">STAR structure</option><option value="technical">Technical and detailed</option><option value="conversational">Conversational</option></select></label><label>Resume notes, job description, or instructions<textarea value={instructions} onChange={(event) => setInstructions(event.target.value)} maxLength={6000} placeholder="Paste relevant, truthful experience and the job requirements…" /><small>{instructions.length} / 6000 characters</small></label><button className="primary-action" type="submit">Save context & return</button></form></div>}
-      </section>
+      {meetingState === "setup" || meetingState === "connecting" ? (
+        <section className="setup-page">
+          <div className="setup-intro"><span className="eyebrow">REAL-TIME MEETING INTELLIGENCE</span><h1>Listen less.<br />Understand more.</h1><p>Capture a permitted meeting, follow the live transcript, and leave with a clear summary, action items, and better follow-up questions.</p><div className="feature-row"><span>Live transcript</span><span>Rolling summary</span><span>Action items</span></div></div>
+          <form className="setup-card" onSubmit={(event) => { event.preventDefault(); void startMeeting(); }}>
+            <div className="card-heading"><span>01</span><div><h2>Start a meeting</h2><p>Choose exactly what the assistant may hear.</p></div></div>
+            <label>Meeting title<input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Weekly team sync" required /></label>
+            <fieldset><legend>Audio source</legend><button className={source === "microphone" ? "selected" : ""} type="button" onClick={() => setSource("microphone")}><strong>Microphone</strong><small>Voices audible near this device</small></button><button className={source === "meeting-tab" ? "selected" : ""} type="button" onClick={() => setSource("meeting-tab")}><strong>Shared meeting tab</strong><small>You select a tab and enable its audio</small></button></fieldset>
+            <label>Meeting context (optional)<textarea value={context} onChange={(event) => setContext(event.target.value)} placeholder="Agenda, project names, vocabulary, or desired outcomes…" /></label>
+            <label className="consent-check"><input type="checkbox" checked={consent} onChange={(event) => setConsent(event.target.checked)} /><span>I confirm all required participants have been informed and this AI assistance is permitted.</span></label>
+            <button className="start-button" type="submit" disabled={!consent || meetingState === "connecting"}>{meetingState === "connecting" ? "Connecting…" : "Start live assistant"}</button>
+            {error && <div className="error-box" role="alert">{error}</div>}
+          </form>
+        </section>
+      ) : (
+        <section className="live-page">
+          <div className="meeting-bar"><div><span className="active-pulse" /><div><strong>{title}</strong><small>{source === "meeting-tab" ? "Shared meeting-tab audio" : "Microphone audio"}</small></div></div><div className="meeting-controls"><span>{time}</span>{processing && <em>Transcribing…</em>}{analyzing && <em>Updating insights…</em>}<button type="button" onClick={meetingState === "live" ? endMeeting : resetMeeting}>{meetingState === "live" ? "End meeting" : "New meeting"}</button></div></div>
+          {error && <div className="error-box wide" role="alert">{error}</div>}
+          <div className="meeting-grid">
+            <section className="transcript-panel"><header><div><span>LIVE TRANSCRIPT · FAST CAPTIONS</span><h2>Conversation</h2></div><div className={`listening-status ${meetingState}`}><i />{meetingState === "live" ? "Listening" : "Ended"}</div></header><div className="transcript-feed">{transcript.length ? transcript.map((segment, index) => <article className={segment.isQuestion ? "question-segment" : ""} key={`${index}-${segment.text.slice(0, 12)}`}><span>{segment.isQuestion ? "Q" : String(index + 1).padStart(2, "0")}</span><div>{segment.isQuestion && <em>QUESTION DETECTED</em>}<p>{segment.text}</p></div></article>) : <div className="waiting-state"><div className="sound-bars">{Array.from({ length: 9 }, (_, index) => <i key={index} />)}</div><strong>Waiting for conversation</strong><p>Captions are submitted in approximately four-second segments.</p></div>}</div></section>
+            <aside className="insight-column"><section className="summary-card"><span>ROLLING SUMMARY</span><h2>What matters so far</h2><p>{summary || "The summary will build automatically as the conversation develops."}</p></section><InsightList title="Action items" empty="No action items detected yet." items={actionItems} accent="coral" /><InsightList title="Suggested follow-ups" empty="Relevant follow-up questions will appear here." items={followUps} accent="green" />{meetingState === "ended" && <button className="download-button" type="button" onClick={downloadTranscript}>Download transcript & notes</button>}</aside>
+          </div>
+          <footer className="disclosure"><strong>AI assistance is active and visible.</strong><span>This app does not hide from screen sharing, capture audio without your selection, or generate interview answers.</span></footer>
+        </section>
+      )}
     </main>
   );
 }
 
-function PageHeading({ overline, title, copy }: { overline: string; title: string; copy: string }) { return <div className="page-heading compact"><div><span className="overline">{overline}</span><h1>{title}</h1><p>{copy}</p></div></div>; }
-function BlankState({ title, copy }: { title: string; copy: string }) { return <div className="blank-state"><strong>{title}</strong><p>{copy}</p></div>; }
-function NoteList({ title, items }: { title: string; items: string[] }) { return <article className="note-list"><h3>{title}</h3><ul>{items.map((item) => <li key={item}>{item}</li>)}</ul></article>; }
+function InsightList({ title, empty, items, accent }: { title: string; empty: string; items: string[]; accent: string }) {
+  return <section className={`insight-card ${accent}`}><h3>{title}</h3>{items.length ? <ul>{items.map((item) => <li key={item}>{item}</li>)}</ul> : <p>{empty}</p>}</section>;
+}
