@@ -26,18 +26,25 @@ router = APIRouter(tags=["meeting"])
 
 QUESTION_STARTERS = re.compile(
     r"^(who|what|when|where|why|how|can|could|would|will|do|does|did|is|are|"
-    r"should|have|has|tell me|walk me through|explain)\b",
+    r"should|have|has|tell me|tell us|walk me through|walk us through|explain|"
+    r"describe|share an example|give me an example|help me understand)\b",
     re.IGNORECASE,
 )
 
 
 def looks_like_question(text: str) -> bool:
     normalized = text.strip()
-    return normalized.endswith("?") or bool(QUESTION_STARTERS.match(normalized))
+    if normalized.endswith("?"):
+        return True
+    candidates = [part.strip(" .,!:-") for part in re.split(r"[?.!]", normalized) if part.strip()]
+    return any(QUESTION_STARTERS.match(candidate) for candidate in candidates[-3:])
 
 
 @router.post("/meeting/transcribe", response_model=TranscriptSegmentResponse)
-async def transcribe_meeting_segment(file: UploadFile = File(...)) -> TranscriptSegmentResponse:
+async def transcribe_meeting_segment(
+    file: UploadFile = File(...),
+    previous_text: str = Form(""),
+) -> TranscriptSegmentResponse:
     settings = get_settings()
     suffix = Path(file.filename or "segment.webm").suffix.lower()
     if suffix not in settings.allowed_audio_suffixes:
@@ -47,10 +54,15 @@ async def transcribe_meeting_segment(file: UploadFile = File(...)) -> Transcript
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
             temp_path = Path(temp_file.name)
         await save_upload(file, temp_path)
-        transcript = await asyncio.to_thread(transcribe_audio, temp_path, fast=True)
+        transcript = await asyncio.to_thread(
+            transcribe_audio,
+            temp_path,
+            fast=True,
+            prompt_context=previous_text[-600:],
+        )
         return TranscriptSegmentResponse(
             transcript=transcript,
-            is_question=looks_like_question(transcript),
+            is_question=looks_like_question(f"{previous_text[-300:]} {transcript}"),
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

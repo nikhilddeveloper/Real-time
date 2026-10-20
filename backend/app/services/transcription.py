@@ -15,7 +15,7 @@ def get_whisper_model():
     return whisper.load_model(get_settings().whisper_model)
 
 
-def transcribe_audio(path: Path, *, fast: bool = False) -> str:
+def transcribe_audio(path: Path, *, fast: bool = False, prompt_context: str = "") -> str:
     settings = get_settings()
     normalized_path: Path | None = None
 
@@ -48,11 +48,15 @@ def transcribe_audio(path: Path, *, fast: bool = False) -> str:
             )
             source_path = normalized_path
 
+        initial_prompt = settings.transcription_prompt
+        if prompt_context.strip():
+            initial_prompt = f"{initial_prompt} Recent conversation: {prompt_context[-600:]}"
+
         result = get_whisper_model().transcribe(
             str(source_path),
             language=settings.transcription_language,
             task="transcribe",
-            initial_prompt=settings.transcription_prompt,
+            initial_prompt=initial_prompt,
             fp16=torch.cuda.is_available(),
             temperature=0,
             beam_size=1 if fast else 5,

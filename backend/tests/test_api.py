@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, patch
 from fastapi.testclient import TestClient
 
 from backend.app.main import app
+from backend.app.api.routes.meeting import looks_like_question
 
 
 class ApiTests(unittest.TestCase):
@@ -21,6 +22,19 @@ class ApiTests(unittest.TestCase):
             files={"file": ("question.txt", b"not audio", "text/plain")},
         )
         self.assertEqual(response.status_code, 415)
+
+    def test_accepts_text_resume(self):
+        response = self.client.post(
+            "/api/profile/resume",
+            files={"file": ("resume.txt", b"Python developer with API testing experience.", "text/plain")},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Python developer", response.json()["text"])
+
+    def test_enhanced_question_detection(self):
+        self.assertTrue(looks_like_question("Tell us about your deployment approach"))
+        self.assertTrue(looks_like_question("Could you explain the project structure"))
+        self.assertFalse(looks_like_question("The deployment completed on Friday."))
 
     @patch(
         "backend.app.api.routes.coach.generate_practice_answer",
